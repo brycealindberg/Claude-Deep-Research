@@ -25,21 +25,37 @@ try:
     import httpx
     from bs4 import BeautifulSoup
     from mcp.server.fastmcp import FastMCP
+    from playwright.async_api import async_playwright, Browser, BrowserContext
 except ImportError:
     print("Installing required dependencies...")
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "httpx", "beautifulsoup4", "mcp"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "httpx", "beautifulsoup4", "mcp", "playwright"])
     import httpx
     from bs4 import BeautifulSoup
     from mcp.server.fastmcp import FastMCP
+    from playwright.async_api import async_playwright, Browser, BrowserContext
+    print("NOTE: Run 'playwright install chromium' to install the browser")
+
+# Module-level browser instance for Playwright (lazy initialization)
+_playwright_instance = None
+_browser_instance: Browser | None = None
 
 # Initialize server with simple lifespan
 @asynccontextmanager
 async def lifespan(app: FastMCP):
     """Context manager for server lifecycle"""
+    global _playwright_instance, _browser_instance
     logger.info("Server starting up...")
     yield {}
     logger.info("Server shutting down...")
+    # Clean up Playwright browser if it was initialized
+    if _browser_instance is not None:
+        logger.info("Closing Playwright browser...")
+        await _browser_instance.close()
+        _browser_instance = None
+    if _playwright_instance is not None:
+        await _playwright_instance.stop()
+        _playwright_instance = None
 
 # Initialize the MCP server
 mcp = FastMCP(
@@ -49,7 +65,7 @@ mcp = FastMCP(
 )
 
 # Configuration
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 MAX_CONTENT_SIZE = 8000  # Maximum characters in the final response
 MAX_RESULTS = 3         # Maximum number of results to process
 
@@ -184,18 +200,28 @@ async def deep_research(query: str, sources: str = "both", num_results: int = 2)
 async def _web_search(query: str, num_results: int) -> str:
     """Perform a web search using DuckDuckGo"""
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-            # Create search URL
-            encoded_query = quote_plus(query)
-            url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-            
-            # Set headers
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            # Modern headers to avoid bot detection
             headers = {
                 "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml"
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
             }
-            
-            # Make request
+
+            # Step 1: Visit homepage first to establish session (required for bot detection bypass)
+            await client.get("https://duckduckgo.com/", headers=headers)
+
+            # Step 2: Now search with session cookies and referer
+            headers["Referer"] = "https://duckduckgo.com/"
+            headers["Sec-Fetch-Site"] = "same-origin"
+
+            encoded_query = quote_plus(query)
+            url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+
             response = await client.get(url, headers=headers)
             response.raise_for_status()
             
@@ -315,68 +341,170 @@ async def _academic_search(query: str, num_results: int) -> str:
         logger.error(f"Academic search error: {str(e)}")
         raise  # Re-raise to handle in the main function
 
-async def _follow_link(url: str) -> str:
-    """Visit a URL and extract its content"""
+async def _get_browser() -> Browser:
+    """Get or create the shared Playwright browser instance."""
+    global _playwright_instance, _browser_instance
+
+    if _browser_instance is None:
+        logger.info("Initializing Playwright browser (lazy)...")
+        _playwright_instance = await async_playwright().start()
+        _browser_instance = await _playwright_instance.chromium.launch(headless=True)
+        logger.info("Playwright browser initialized")
+
+    return _browser_instance
+
+
+def _extract_content_from_soup(soup: BeautifulSoup, url: str) -> tuple[str, int]:
+    """
+    Extract meaningful content from a BeautifulSoup object.
+
+    Returns:
+        tuple of (formatted_result, meaningful_text_length)
+    """
+    # Get title
+    title = soup.title.string.strip() if soup.title and soup.title.string else "No title"
+
+    # Get description
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    description = meta_desc["content"] if meta_desc and meta_desc.has_attr("content") else "No description available"
+
+    # Get content
+    content_texts = []
+
+    # Try to get paragraphs
+    paragraphs = soup.find_all('p')
+    for i, p in enumerate(paragraphs):
+        if i >= 5:  # Limit to 5 paragraphs
+            break
+        text = p.get_text().strip()
+        if text and len(text) > 15:
+            content_texts.append(text[:300])
+
+    # If not enough paragraphs, try other elements
+    if len(content_texts) < 2:
+        elements = soup.find_all(['h1', 'h2', 'h3', 'p'])
+        for i, elem in enumerate(elements):
+            if i >= 8:
+                break
+            text = elem.get_text().strip()
+            if text and len(text) > 10:
+                content_texts.append(text[:200])
+
+    # If still no content, use whatever text we can find
+    if not content_texts:
+        all_text = soup.get_text()
+        clean_text = re.sub(r'\s+', ' ', all_text).strip()
+        content_texts = [clean_text[:500]]
+
+    # Calculate meaningful text length (sum of all extracted content)
+    meaningful_length = sum(len(t) for t in content_texts)
+
+    # Format output
+    content = "\n\n".join(content_texts)
+    result = f"Title: {title[:100]}\nURL: {url}\nDescription: {description[:200]}\n\nContent:\n{content}"
+
+    return result, meaningful_length
+
+
+async def _simple_fetch(url: str) -> tuple[str, int]:
+    """
+    Fetch a URL using httpx (fast, no JS execution).
+
+    Returns:
+        tuple of (formatted_result, meaningful_text_length)
+        Returns (None, 0) if content type is PDF
+    """
+    async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+        # Set headers
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml"
+        }
+
+        # Make request
+        response = await client.get(url, headers=headers)
+
+        # Check content type
+        content_type = response.headers.get("content-type", "").lower()
+        if "application/pdf" in content_type:
+            return f"Title: PDF Document\nURL: {url}\n\nContent: [PDF document - contents cannot be extracted directly]", -1
+
+        # Parse HTML
+        soup = BeautifulSoup(response.text[:100000], "html.parser")  # Limit size
+
+        return _extract_content_from_soup(soup, url)
+
+
+async def _playwright_fetch(url: str) -> str:
+    """
+    Fetch a URL using Playwright (headless browser with JS execution).
+    Used as fallback when simple fetch yields thin content.
+    """
+    browser = await _get_browser()
+    context: BrowserContext | None = None
+
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
-            # Set headers
-            headers = {
-                "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml"
-            }
-            
-            # Make request
-            response = await client.get(url, headers=headers)
-            
-            # Check content type
-            content_type = response.headers.get("content-type", "").lower()
-            if "application/pdf" in content_type:
-                return f"Title: PDF Document\nURL: {url}\n\nContent: [PDF document - contents cannot be extracted directly]"
-                
-            # Parse HTML
-            soup = BeautifulSoup(response.text[:100000], "html.parser")  # Limit size
-            
-            # Get title
-            title = soup.title.string.strip() if soup.title and soup.title.string else "No title"
-            
-            # Get description
-            meta_desc = soup.find("meta", attrs={"name": "description"})
-            description = meta_desc["content"] if meta_desc and meta_desc.has_attr("content") else "No description available"
-            
-            # Get content
-            content_texts = []
-            
-            # Try to get paragraphs
-            paragraphs = soup.find_all('p')
-            for i, p in enumerate(paragraphs):
-                if i >= 5:  # Limit to 5 paragraphs
-                    break
-                text = p.get_text().strip()
-                if text and len(text) > 15:
-                    content_texts.append(text[:300])
-                    
-            # If not enough paragraphs, try other elements
-            if len(content_texts) < 2:
-                elements = soup.find_all(['h1', 'h2', 'h3', 'p'])
-                for i, elem in enumerate(elements):
-                    if i >= 8:
-                        break
-                    text = elem.get_text().strip()
-                    if text and len(text) > 10:
-                        content_texts.append(text[:200])
-                        
-            # If still no content, use whatever text we can find
-            if not content_texts:
-                all_text = soup.get_text()
-                clean_text = re.sub(r'\s+', ' ', all_text).strip()
-                content_texts = [clean_text[:500]]
-                
-            # Format output
-            content = "\n\n".join(content_texts)
-            result = f"Title: {title[:100]}\nURL: {url}\nDescription: {description[:200]}\n\nContent:\n{content}"
-            
+        # Create a new context for this request (isolated cookies/storage)
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 720}
+        )
+
+        page = await context.new_page()
+
+        # Navigate to URL with timeout and wait for network to settle
+        await page.goto(url, wait_until="networkidle", timeout=8000)
+
+        # Give extra time for any remaining JS to execute
+        await page.wait_for_timeout(1000)
+
+        # Get the rendered HTML content
+        html_content = await page.content()
+
+        # Parse with BeautifulSoup
+        soup = BeautifulSoup(html_content[:100000], "html.parser")
+
+        result, _ = _extract_content_from_soup(soup, url)
+        return result
+
+    finally:
+        # Always close the context to free resources
+        if context is not None:
+            await context.close()
+
+
+# Minimum characters of meaningful content before triggering Playwright fallback
+MIN_CONTENT_THRESHOLD = 200
+
+
+async def _follow_link(url: str) -> str:
+    """
+    Visit a URL and extract its content.
+
+    Uses a two-tier approach:
+    1. Try simple httpx fetch first (fast, no JS)
+    2. If content is too thin (< 200 chars), fall back to Playwright for JS rendering
+    """
+    try:
+        # First, try the fast simple fetch
+        result, meaningful_length = await _simple_fetch(url)
+
+        # If it's a PDF, return immediately (meaningful_length == -1)
+        if meaningful_length == -1:
             return result
-            
+
+        # Check if content is too thin - might be a JS-heavy site
+        if meaningful_length < MIN_CONTENT_THRESHOLD:
+            logger.info(f"Thin content ({meaningful_length} chars) from simple fetch for {url}, falling back to Playwright")
+            try:
+                result = await _playwright_fetch(url)
+                logger.info(f"Playwright fallback successful for {url}")
+            except Exception as pw_error:
+                logger.warning(f"Playwright fallback failed for {url}: {str(pw_error)}, using simple fetch result")
+                # Return the original thin content rather than failing completely
+
+        return result
+
     except Exception as e:
         logger.error(f"Error following link: {str(e)}")
         raise  # Re-raise to handle in the main function
